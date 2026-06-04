@@ -761,7 +761,7 @@ if app_mode == "Constant Leverage":
         st.write("")
 
    if app_mode == "Constant Leverage":
-    if trigger_mode == "Dividend Yield Delta":
+           if trigger_mode == "Dividend Yield Delta":
         st.caption(
             "Example: base 100%, then allocate 125% when dividend yield minus the selected rate is above Tier 1, and 150% when it is above Tier 2. "
             "If the nominal throttle is on and nominal borrowing cost is too high, the app caps exposure at 100% even if the dividend-yield delta rule wants leverage."
@@ -771,7 +771,7 @@ if app_mode == "Constant Leverage":
             "Example: base 100%, then allocate 125% when the selected real rate is below 2%, and 150% when it is below 1%. "
             "If the nominal throttle is on and nominal borrowing cost is too high, the app caps exposure at 100% even if the real-rate rule wants leverage."
         )
-
+    
     if tier2_threshold_pct > tier1_threshold_pct:
         st.warning("Tier 2 threshold is usually lower than Tier 1 if you want deeper easing to trigger more leverage.")
 
