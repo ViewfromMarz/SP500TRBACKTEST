@@ -44,6 +44,120 @@ def load_monthly_fred_series(series_id, start, end, output_col):
 
 
 @st.cache_data(show_spinner=False)
+def load_uploaded_dividend_yield_data(file_bytes):
+    raw = pd.read_excel(io.BytesIO(file_bytes))
+    raw.columns = [str(c).strip() for c in raw.columns]
+    lower_map = {c.lower(): c for c in raw.columns}
+
+    date_col = None
+    for candidate in ["date", "month"]:
+        if candidate in lower_map:
+            date_col = lower_map[candidate]
+            break
+    if date_col is None:
+        possible = [c for c in raw.columns if "date" in c.lower() or "month" in c.lower()]
+        if possible:
+            date_col = possible[0]
+
+    div_col = None
+    for candidate in ["div yield", "dividend yield", "divident yiled", "sp500 dividend yield"]:
+        if candidate in lower_map:
+            div_col = lower_map[candidate]
+            break
+    if div_col is None:
+        possible = [c for c in raw.columns if "div" in c.lower() and "yield" in c.lower()]
+        if possible:
+            div_col = possible[0]
+
+    if date_col is None or div_col is None:
+        raise ValueError(f"Could not identify dividend-yield file columns. Found columns: {list(raw.columns)}")
+
+    df = raw[[date_col, div_col]].copy()
+    df.columns = ["date_raw", "sp500_dividend_yield"]
+
+    date_text = df["date_raw"].astype(str).str.strip()
+    date_text = date_text.str.replace(r"[^0-9.]", "", regex=True)
+    date_text = date_text.str.replace(r"^(\d{4})\.(\d)$", r"\1.0\2", regex=True)
+    parsed = pd.to_datetime(date_text, format="%Y.%m", errors="coerce")
+    fallback = pd.to_datetime(df["date_raw"], errors="coerce")
+
+    df["date"] = parsed.fillna(fallback)
+    df["date"] = pd.to_datetime(df["date"]).dt.to_period("M").dt.to_timestamp()
+    df["sp500_dividend_yield"] = pd.to_numeric(df["sp500_dividend_yield"], errors="coerce")
+    df = df.dropna(subset=["date", "sp500_dividend_yield"]).copy()
+    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    return df[["date", "sp500_dividend_yield"]]
+
+
+def build_dividend_delta_signal(start, end, uploaded_file_bytes):
+    if uploaded_file_bytes is None:
+        raise ValueError("Please upload a dividend-yield file to use the Dividend Yield Delta signal.")
+
+    pad_start = pd.to_datetime(start) - pd.DateOffset(years=2)
+    pad_end = pd.to_datetime(end) + pd.DateOffset(months=1)
+
+    div_df = load_uploaded_dividend_yield_data(uploaded_file_bytes)
+    div_df = div_df.loc[(div_df["date"] >= pad_start.to_period("M").to_timestamp()) & (div_df["date"] <= pad_end.to_period("M").to_timestamp())].copy()
+
+    gs1 = load_monthly_fred_series("GS1", pad_start, pad_end, "gs1")
+    gs10 = load_monthly_fred_series("GS10", pad_start, pad_end, "gs10")
+    real_1y = load_monthly_fred_series("REAINTRATREARAT1YE", pad_start, pad_end, "real_1y")
+    real_10y = load_monthly_fred_series("REAINTRATREARAT10Y", pad_start, pad_end, "real_10y")
+
+    rates_df = gs1.join(gs10, how="outer").join(real_1y, how="outer").join(real_10y, how="outer")
+    rates_df = rates_df.reset_index().rename(columns={"Date": "date"})
+    rates_df["date"] = pd.to_datetime(rates_df["date"]).dt.to_period("M").dt.to_timestamp()
+
+    merged = pd.merge(div_df, rates_df, on="date", how="left").sort_values("date").reset_index(drop=True)
+    merged["div_minus_gs1"] = merged["sp500_dividend_yield"] - merged["gs1"]
+    merged["div_minus_gs10"] = merged["sp500_dividend_yield"] - merged["gs10"]
+    merged["div_minus_real_1y"] = merged["sp500_dividend_yield"] - merged["real_1y"]
+    merged["div_minus_real_10y"] = merged["sp500_dividend_yield"] - merged["real_10y"]
+    return merged
+
+
+def map_dividend_delta_to_daily(df, monthly_signal_df, signal_col):
+    out = df.copy()
+    monthly = monthly_signal_df[["date", signal_col]].copy().rename(columns={signal_col: "Dividend_Delta_Signal"})
+    monthly = monthly.sort_values("date")
+    out = out.reset_index().rename(columns={"index": "Date"})
+    out["signal_month"] = pd.to_datetime(out["Date"]).dt.to_period("M").dt.to_timestamp()
+    out = out.merge(monthly, left_on="signal_month", right_on="date", how="left")
+    out = out.drop(columns=["signal_month", "date"])
+    out = out.set_index("Date")
+    out["Dividend_Delta_Signal"] = pd.to_numeric(out["Dividend_Delta_Signal"], errors="coerce").ffill() / 100.0
+    return out
+
+
+def select_trigger_value(row, trigger_mode, real_rate_source):
+    if trigger_mode == "Dividend Yield Delta":
+        return float(row["Dividend_Delta_Signal"])
+    return select_real_rate(row, real_rate_source)
+
+
+def determine_tiered_allocation_from_trigger(trigger_value, tier1_threshold_pct, tier1_alloc_pct, tier2_threshold_pct, tier2_alloc_pct, base_alloc_pct, trigger_mode):
+    base_alloc = base_alloc_pct / 100.0
+    tier1_alloc = tier1_alloc_pct / 100.0
+    tier2_alloc = tier2_alloc_pct / 100.0
+
+    if pd.isna(trigger_value):
+        return base_alloc, "No trigger data"
+
+    if trigger_mode == "Dividend Yield Delta":
+        if trigger_value > (tier2_threshold_pct / 100.0):
+            return tier2_alloc, f"Div delta > {tier2_threshold_pct:.2f}%"
+        if trigger_value > (tier1_threshold_pct / 100.0):
+            return tier1_alloc, f"Div delta > {tier1_threshold_pct:.2f}%"
+        return base_alloc, "Base allocation"
+
+    if trigger_value < (tier2_threshold_pct / 100.0):
+        return tier2_alloc, f"Real rate < {tier2_threshold_pct:.2f}%"
+    if trigger_value < (tier1_threshold_pct / 100.0):
+        return tier1_alloc, f"Real rate < {tier1_threshold_pct:.2f}%"
+    return base_alloc, "Base allocation"
+
+
+@st.cache_data(show_spinner=False)
 def load_dividend_yield_rates_data(start, end):
     pad_start = pd.to_datetime(start) - pd.DateOffset(years=2)
     pad_end = pd.to_datetime(end) + pd.DateOffset(months=1)
@@ -335,6 +449,7 @@ def run_constant_leverage_backtest(
     borrow_spread_bps,
     use_nominal_gate,
     nominal_cap_pct,
+    trigger_mode,
     real_rate_source,
     base_alloc_pct,
     tier1_threshold_pct,
@@ -346,14 +461,15 @@ def run_constant_leverage_backtest(
     if len(data) < 3:
         raise ValueError("Not enough data in selected window.")
 
-    first_real = select_real_rate(data.iloc[0], real_rate_source)
-    first_target_alloc, first_rule = determine_tiered_allocation(
-        first_real,
+    first_trigger = select_trigger_value(data.iloc[0], trigger_mode, real_rate_source)
+    first_target_alloc, first_rule = determine_tiered_allocation_from_trigger(
+        first_trigger,
         tier1_threshold_pct,
         tier1_alloc_pct,
         tier2_threshold_pct,
         tier2_alloc_pct,
         base_alloc_pct,
+        trigger_mode,
     )
     first_nominal = float(data.iloc[0]["Cash_Yield"] + (borrow_spread_bps / 10000.0))
     first_nominal_ok = True if not use_nominal_gate else first_nominal < (nominal_cap_pct / 100.0)
@@ -367,21 +483,22 @@ def run_constant_leverage_backtest(
     leverage_flag = [current_alloc > 1.0]
     nominal_gate_pass_hist = [first_nominal_ok]
     nominal_borrow_rate_hist = [first_nominal]
-    real_rate_hist = [first_real]
+    real_rate_hist = [first_trigger]
     borrow_rate_daily_hist = [np.nan]
 
     idx = data.index.tolist()
     for i in range(1, len(idx)):
         row = data.loc[idx[i]]
 
-        real_rate = select_real_rate(row, real_rate_source)
-        target_alloc, rule_label = determine_tiered_allocation(
-            real_rate,
+        trigger_value = select_trigger_value(row, trigger_mode, real_rate_source)
+        target_alloc, rule_label = determine_tiered_allocation_from_trigger(
+            trigger_value,
             tier1_threshold_pct,
             tier1_alloc_pct,
             tier2_threshold_pct,
             tier2_alloc_pct,
             base_alloc_pct,
+            trigger_mode,
         )
         nominal_borrow_rate = float(row["Cash_Yield"] + (borrow_spread_bps / 10000.0))
         nominal_ok = True if not use_nominal_gate else nominal_borrow_rate < (nominal_cap_pct / 100.0)
@@ -400,7 +517,7 @@ def run_constant_leverage_backtest(
         leverage_flag.append(current_alloc > 1.0)
         nominal_gate_pass_hist.append(nominal_ok)
         nominal_borrow_rate_hist.append(nominal_borrow_rate)
-        real_rate_hist.append(real_rate)
+        real_rate_hist.append(trigger_value)
         borrow_rate_daily_hist.append(borrow_rate_daily)
 
     out = data.iloc[: len(strategy_vals)].copy()
@@ -576,13 +693,40 @@ if app_mode == "Constant Leverage":
             key="const_reinvest_toggle",
         )
     with rowc1[1]:
-        real_rate_source = st.radio(
+        trigger_mode = st.radio(
+            "Trigger mode",
+            ["Real Rate", "Dividend Yield Delta"],
+            horizontal=True,
+        )
+
+    real_rate_source = st.radio(
             "Real-rate source",
             [
                 "1-Year Real Rate (FRED REAINTRATREARAT1YE)",
                 "10-Year Real Rate (FRED REAINTRATREARAT10Y)",
             ],
             horizontal=True,
+        )
+
+    uploaded_div_yield_file = None
+    div_delta_rate_choice = None
+    if trigger_mode == "Dividend Yield Delta":
+        st.markdown("### Dividend yield delta input")
+        uploaded_div_yield_file = st.file_uploader(
+            "Upload dividend-yield file (.xlsx)",
+            type=["xlsx", "xls"],
+            key="const_div_yield_upload",
+            help="File should contain Date and dividend yield columns, such as Date and Div Yield.",
+        )
+        div_delta_rate_choice = st.selectbox(
+            "Delta comparison series",
+            [
+                "Dividend Yield - 1Y Nominal",
+                "Dividend Yield - 1Y Real",
+                "Dividend Yield - 10Y Nominal",
+                "Dividend Yield - 10Y Real",
+            ],
+            index=1,
         )
 
     st.markdown("### Nominal throttle")
@@ -616,10 +760,16 @@ if app_mode == "Constant Leverage":
     with rowt2[2]:
         st.write("")
 
-    st.caption(
-        "Example: base 100%, then allocate 125% when the selected real rate is below 2%, and 150% when it is below 1%. "
-        "If the nominal throttle is on and nominal borrowing cost is too high, the app caps exposure at 100% even if the real-rate rule wants leverage."
-    )
+    if trigger_mode == "Dividend Yield Delta":
+        st.caption(
+            "Example: base 100%, then allocate 125% when dividend yield minus the selected rate is above Tier 1, and 150% when it is above Tier 2. "
+            "If the nominal throttle is on and nominal borrowing cost is too high, the app caps exposure at 100% even if the dividend-yield delta rule wants leverage."
+        )
+    else:
+        st.caption(
+            "Example: base 100%, then allocate 125% when the selected real rate is below 2%, and 150% when it is below 1%. "
+            "If the nominal throttle is on and nominal borrowing cost is too high, the app caps exposure at 100% even if the real-rate rule wants leverage."
+        )
 
     if tier2_threshold_pct > tier1_threshold_pct:
         st.warning("Tier 2 threshold is usually lower than Tier 1 if you want deeper easing to trigger more leverage.")
@@ -628,6 +778,18 @@ if app_mode == "Constant Leverage":
         try:
             df = load_gspc_data(start_date, end_date)
             df_run, used_tr = choose_return_stream(df, reinvest_dividends)
+
+            if trigger_mode == "Dividend Yield Delta":
+                if uploaded_div_yield_file is None:
+                    raise ValueError("Please upload a dividend-yield file before running the Dividend Yield Delta backtest.")
+                monthly_delta = build_dividend_delta_signal(start_date, end_date, uploaded_div_yield_file.getvalue())
+                signal_col_map = {
+                    "Dividend Yield - 1Y Nominal": "div_minus_gs1",
+                    "Dividend Yield - 1Y Real": "div_minus_real_1y",
+                    "Dividend Yield - 10Y Nominal": "div_minus_gs10",
+                    "Dividend Yield - 10Y Real": "div_minus_real_10y",
+                }
+                df_run = map_dividend_delta_to_daily(df_run, monthly_delta, signal_col_map[div_delta_rate_choice])
             bt = run_constant_leverage_backtest(
                 df=df_run,
                 start=start_date,
@@ -636,6 +798,7 @@ if app_mode == "Constant Leverage":
                 borrow_spread_bps=borrow_spread_bps,
                 use_nominal_gate=use_nominal_gate,
                 nominal_cap_pct=nominal_cap_pct,
+                trigger_mode=trigger_mode,
                 real_rate_source=real_rate_source,
                 base_alloc_pct=base_alloc_pct,
                 tier1_threshold_pct=tier1_threshold_pct,
@@ -666,8 +829,11 @@ if app_mode == "Constant Leverage":
             st.markdown("## Equity curves")
             st.line_chart(bt[["Strategy_Value", "Benchmark_Value"]])
 
-            st.markdown("## Allocation and real rate")
-            st.line_chart(bt[["Allocation_Pct", "Desired_Allocation_Pct", "Selected_Real_Rate", "Nominal_Borrow_Rate_Annual"]])
+            st.markdown("## Allocation and trigger")
+            trigger_cols = ["Allocation_Pct", "Desired_Allocation_Pct", "Selected_Real_Rate", "Nominal_Borrow_Rate_Annual"]
+            if trigger_mode == "Dividend Yield Delta" and "Dividend_Delta_Signal" in bt.columns:
+                trigger_cols = ["Allocation_Pct", "Desired_Allocation_Pct", "Dividend_Delta_Signal", "Nominal_Borrow_Rate_Annual"]
+            st.line_chart(bt[trigger_cols])
 
             st.markdown("## Annual snapshot")
             annual = annual_snapshot(bt)
@@ -739,6 +905,18 @@ elif app_mode == "Buy the Dip off Highs":
         try:
             df = load_gspc_data(start_date, end_date)
             df_run, used_tr = choose_return_stream(df, reinvest_dividends)
+
+            if trigger_mode == "Dividend Yield Delta":
+                if uploaded_div_yield_file is None:
+                    raise ValueError("Please upload a dividend-yield file before running the Dividend Yield Delta backtest.")
+                monthly_delta = build_dividend_delta_signal(start_date, end_date, uploaded_div_yield_file.getvalue())
+                signal_col_map = {
+                    "Dividend Yield - 1Y Nominal": "div_minus_gs1",
+                    "Dividend Yield - 1Y Real": "div_minus_real_1y",
+                    "Dividend Yield - 10Y Nominal": "div_minus_gs10",
+                    "Dividend Yield - 10Y Real": "div_minus_real_10y",
+                }
+                df_run = map_dividend_delta_to_daily(df_run, monthly_delta, signal_col_map[div_delta_rate_choice])
             bt = run_buy_the_dip_backtest(
                 df=df_run,
                 start=start_date,
