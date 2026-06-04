@@ -760,6 +760,7 @@ if app_mode == "Constant Leverage":
     with rowt2[2]:
         st.write("")
 
+   if app_mode == "Constant Leverage":
     if trigger_mode == "Dividend Yield Delta":
         st.caption(
             "Example: base 100%, then allocate 125% when dividend yield minus the selected rate is above Tier 1, and 150% when it is above Tier 2. "
