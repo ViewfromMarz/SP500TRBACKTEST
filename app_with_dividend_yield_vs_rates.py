@@ -905,17 +905,6 @@ elif app_mode == "Buy the Dip off Highs":
             df = load_gspc_data(start_date, end_date)
             df_run, used_tr = choose_return_stream(df, reinvest_dividends)
 
-            if trigger_mode == "Dividend Yield Delta":
-                if uploaded_div_yield_file is None:
-                    raise ValueError("Please upload a dividend-yield file before running the Dividend Yield Delta backtest.")
-                monthly_delta = build_dividend_delta_signal(start_date, end_date, uploaded_div_yield_file.getvalue())
-                signal_col_map = {
-                    "Dividend Yield - 1Y Nominal": "div_minus_gs1",
-                    "Dividend Yield - 1Y Real": "div_minus_real_1y",
-                    "Dividend Yield - 10Y Nominal": "div_minus_gs10",
-                    "Dividend Yield - 10Y Real": "div_minus_real_10y",
-                }
-                df_run = map_dividend_delta_to_daily(df_run, monthly_delta, signal_col_map[div_delta_rate_choice])
             bt = run_buy_the_dip_backtest(
                 df=df_run,
                 start=start_date,
